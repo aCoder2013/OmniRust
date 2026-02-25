@@ -24,9 +24,8 @@ Download the latest pre-built binary for your platform from [Releases](https://g
 | Platform | Target | Download |
 |----------|--------|----------|
 | Linux x86_64 | `x86_64-unknown-linux-gnu` | `omnirust-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux x86_64 (static) | `x86_64-unknown-linux-musl` | `omnirust-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` | `omnirust-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS x86_64 | `x86_64-apple-darwin` | `omnirust-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
+| macOS Intel | `x86_64-apple-darwin` | `omnirust-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
 | macOS Apple Silicon | `aarch64-apple-darwin` | `omnirust-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `omnirust-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
 
