@@ -1,8 +1,5 @@
 # OmniRust
 
-![OmniRust Logo](https://via.placeholder.com/800x200/FF4500/FFFFFF?text=OmniRust)  
-*(Replace with your orange flame + Rust gear logo)*
-
 **OmniRust — All your developer tools. One blazingly fast Rust binary.**
 
 [![Crates.io](https://img.shields.io/crates/v/omnirust.svg)](https://crates.io/crates/omnirust)
