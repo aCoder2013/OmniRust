@@ -1,6 +1,7 @@
 use crate::engine::{ColumnInfo, QueryResult};
 use colored::Colorize;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, ContentArrangement, Table};
+use serde_json::Value;
 
 pub fn render_table(result: &QueryResult) {
     let mut table = Table::new();
@@ -146,4 +147,206 @@ pub fn render_histogram(data: &[(f64, f64, i64)], column: &str) {
         );
     }
     println!();
+}
+
+pub fn render_jsonpath_results(results: &[Value], expr: &str) {
+    if results.is_empty() {
+        println!("  {}", "No results matched.".yellow());
+        println!();
+        println!(
+            "  {} Run {} to see available syntax.",
+            "Tip:".bold(),
+            "omnirust json path --syntax".cyan()
+        );
+        return;
+    }
+
+    println!(
+        "  {} {} matched {} result(s)\n",
+        "✓".green().bold(),
+        expr.cyan(),
+        results.len().to_string().bold()
+    );
+
+    let all_objects = results.iter().all(Value::is_object);
+    if all_objects && results.len() > 1 {
+        render_objects_as_table(results);
+    } else if results.len() == 1 {
+        render_single_value(&results[0]);
+    } else {
+        render_value_list(results);
+    }
+}
+
+fn render_objects_as_table(values: &[Value]) {
+    let mut all_keys: Vec<String> = Vec::new();
+    for val in values {
+        if let Value::Object(map) = val {
+            for key in map.keys() {
+                if !all_keys.contains(key) {
+                    all_keys.push(key.clone());
+                }
+            }
+        }
+    }
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+
+    let headers: Vec<Cell> = all_keys.iter().map(Cell::new).collect();
+    table.set_header(headers);
+
+    for val in values {
+        if let Value::Object(map) = val {
+            let cells: Vec<Cell> = all_keys
+                .iter()
+                .map(|k| {
+                    let v = map.get(k).unwrap_or(&Value::Null);
+                    Cell::new(format_value_compact(v))
+                })
+                .collect();
+            table.add_row(cells);
+        }
+    }
+
+    println!("{}", table);
+    println!("  {} rows", values.len().to_string().bold());
+}
+
+fn render_single_value(val: &Value) {
+    match val {
+        Value::Object(_) | Value::Array(_) => {
+            let pretty = serde_json::to_string_pretty(val).unwrap_or_default();
+            for line in pretty.lines() {
+                println!("  {}", line);
+            }
+        }
+        _ => {
+            println!("  {}", format_value_compact(val).cyan());
+        }
+    }
+}
+
+fn render_value_list(values: &[Value]) {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+
+    table.set_header(vec![Cell::new("#"), Cell::new("value")]);
+
+    for (i, val) in values.iter().enumerate() {
+        table.add_row(vec![Cell::new(i), Cell::new(format_value_compact(val))]);
+    }
+
+    println!("{}", table);
+    println!("  {} items", values.len().to_string().bold());
+}
+
+fn format_value_compact(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => {
+            if arr.len() <= 3 {
+                format!(
+                    "[{}]",
+                    arr.iter()
+                        .map(format_value_compact)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                format!(
+                    "[{}, … +{}]",
+                    arr.iter()
+                        .take(2)
+                        .map(format_value_compact)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    arr.len() - 2
+                )
+            }
+        }
+        Value::Object(map) => {
+            if map.len() <= 3 {
+                format!(
+                    "{{{}}}",
+                    map.iter()
+                        .map(|(k, v)| format!("{}:{}", k, format_value_compact(v)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                format!(
+                    "{{{}, … +{}}}",
+                    map.iter()
+                        .take(2)
+                        .map(|(k, v)| format!("{}:{}", k, format_value_compact(v)))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    map.len() - 2
+                )
+            }
+        }
+    }
+}
+
+pub fn render_keys(keys: &[String], path_hint: &str) {
+    if keys.is_empty() {
+        println!("  {}", "No keys found.".yellow());
+        return;
+    }
+
+    println!(
+        "  {} at {}\n",
+        "Available keys".bold().cyan(),
+        if path_hint.is_empty() {
+            "$".to_string()
+        } else {
+            path_hint.to_string()
+        }
+        .dimmed()
+    );
+
+    for key in keys {
+        println!("    {} {}", "•".dimmed(), key);
+    }
+    println!();
+    println!(
+        "  {} Use {} to extract values.",
+        "Tip:".bold(),
+        format!(
+            "omnirust json path <file> \"$.{}\"",
+            keys.first().unwrap_or(&"key".to_string())
+        )
+        .cyan()
+    );
+}
+
+pub fn render_syntax_guide(guide: &str) {
+    for line in guide.lines() {
+        if line.contains("JSONPath Syntax Guide")
+            || line.contains("Filter Operators")
+            || line.contains("Quick Examples")
+        {
+            println!("{}", line.bold().cyan());
+        } else if line.contains("──") || line.trim().starts_with('#') {
+            println!("{}", line.dimmed());
+        } else if line.contains("  →  ") || line.contains(" → ") {
+            let parts: Vec<&str> = line.splitn(2, '→').collect();
+            if parts.len() == 2 {
+                print!("{}→ ", parts[0]);
+                println!("{}", parts[1].trim().green());
+            } else {
+                println!("{}", line);
+            }
+        } else {
+            println!("{}", line);
+        }
+    }
 }

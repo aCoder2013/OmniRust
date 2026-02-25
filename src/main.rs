@@ -1,8 +1,9 @@
 mod display;
 mod engine;
+mod jsonpath;
 mod timestamp;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::time::Instant;
@@ -99,6 +100,25 @@ enum JsonAction {
         #[arg(short, long)]
         columns: Option<String>,
     },
+    /// Extract data using JSONPath expression
+    Path {
+        /// Path to JSON file (omit with --syntax to see syntax guide)
+        file: Option<String>,
+        /// JSONPath expression (e.g. "$[*].name")
+        #[arg(short = 'e', long = "expr")]
+        expression: Option<String>,
+        /// Show JSONPath syntax reference
+        #[arg(long)]
+        syntax: bool,
+    },
+    /// List available keys at a JSONPath location
+    Keys {
+        /// Path to JSON file
+        file: String,
+        /// JSONPath to inspect (default: root)
+        #[arg(short = 'e', long = "expr")]
+        expression: Option<String>,
+    },
     /// Render a terminal chart
     Chart {
         /// Path to JSON file
@@ -128,6 +148,16 @@ fn main() -> Result<()> {
 }
 
 fn handle_json(action: JsonAction) -> Result<()> {
+    if let JsonAction::Path {
+        syntax: true,
+        file: None,
+        ..
+    } = &action
+    {
+        display::render_syntax_guide(jsonpath::syntax_guide());
+        return Ok(());
+    }
+
     let start = Instant::now();
 
     let file = match &action {
@@ -135,8 +165,72 @@ fn handle_json(action: JsonAction) -> Result<()> {
         | JsonAction::Head { file, .. }
         | JsonAction::Query { file, .. }
         | JsonAction::Stats { file, .. }
-        | JsonAction::Chart { file, .. } => file.clone(),
+        | JsonAction::Chart { file, .. }
+        | JsonAction::Keys { file, .. } => file.clone(),
+        JsonAction::Path { file, syntax, .. } => {
+            if *syntax {
+                display::render_syntax_guide(jsonpath::syntax_guide());
+                return Ok(());
+            }
+            match file {
+                Some(f) => f.clone(),
+                None => bail!("Please provide a JSON file. Use --syntax to see JSONPath help."),
+            }
+        }
     };
+
+    match &action {
+        JsonAction::Path {
+            expression, syntax, ..
+        } => {
+            if *syntax {
+                display::render_syntax_guide(jsonpath::syntax_guide());
+                return Ok(());
+            }
+
+            let content = std::fs::read_to_string(&file)
+                .with_context(|| format!("Failed to read file: {}", file))?;
+            let json: serde_json::Value = serde_json::from_str(&content)
+                .with_context(|| format!("Invalid JSON in file: {}", file))?;
+
+            let expr = match expression {
+                Some(e) => e.as_str(),
+                None => {
+                    display::render_syntax_guide(jsonpath::syntax_guide());
+                    return Ok(());
+                }
+            };
+
+            let results = jsonpath::parse_and_eval(&json, expr)?;
+            display::render_jsonpath_results(&results, expr);
+
+            let elapsed = start.elapsed();
+            eprintln!(
+                "\n  {} Completed in {:.3}s",
+                "⏱".dimmed(),
+                elapsed.as_secs_f64()
+            );
+            return Ok(());
+        }
+        JsonAction::Keys { expression, .. } => {
+            let content = std::fs::read_to_string(&file)
+                .with_context(|| format!("Failed to read file: {}", file))?;
+            let json: serde_json::Value = serde_json::from_str(&content)
+                .with_context(|| format!("Invalid JSON in file: {}", file))?;
+
+            let keys = jsonpath::list_keys(&json, expression.as_deref())?;
+            display::render_keys(&keys, expression.as_deref().unwrap_or("$"));
+
+            let elapsed = start.elapsed();
+            eprintln!(
+                "\n  {} Completed in {:.3}s",
+                "⏱".dimmed(),
+                elapsed.as_secs_f64()
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
 
     let eng = engine::Engine::new()?;
     eng.register_json(&file)?;
@@ -184,6 +278,7 @@ fn handle_json(action: JsonAction) -> Result<()> {
             }
             other => bail!("Unknown chart type '{}'. Use 'bar' or 'hist'.", other),
         },
+        JsonAction::Path { .. } | JsonAction::Keys { .. } => unreachable!(),
     }
 
     let elapsed = start.elapsed();
