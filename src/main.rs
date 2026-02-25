@@ -1,5 +1,6 @@
 mod display;
 mod engine;
+mod timestamp;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -23,6 +24,44 @@ enum Commands {
     Json {
         #[command(subcommand)]
         action: JsonAction,
+    },
+    /// Timestamp conversion and utilities
+    Ts {
+        #[command(subcommand)]
+        action: TsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TsAction {
+    /// Show current timestamp
+    Now {
+        /// Unit: s, ms, us, ns
+        #[arg(short, long, default_value = "s")]
+        unit: String,
+    },
+    /// Convert timestamp to human-readable date
+    ToDate {
+        /// Integer timestamp value
+        timestamp: String,
+        /// Unit: s, ms, us, ns (auto-detected if omitted)
+        #[arg(short, long)]
+        unit: Option<String>,
+    },
+    /// Convert date string to timestamp
+    ToTs {
+        /// Date string (RFC3339, "YYYY-MM-DD HH:MM:SS", "YYYY-MM-DD")
+        date: String,
+        /// Output unit: s, ms, us, ns
+        #[arg(short, long, default_value = "s")]
+        unit: String,
+    },
+    /// Calculate duration between two timestamps or dates
+    Diff {
+        /// First timestamp or date
+        a: String,
+        /// Second timestamp or date
+        b: String,
     },
 }
 
@@ -84,6 +123,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Json { action } => handle_json(action),
+        Commands::Ts { action } => handle_ts(action),
     }
 }
 
@@ -154,6 +194,15 @@ fn handle_json(action: JsonAction) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn handle_ts(action: TsAction) -> Result<()> {
+    match action {
+        TsAction::Now { unit } => timestamp::cmd_now(&unit),
+        TsAction::ToDate { timestamp, unit } => timestamp::cmd_to_date(&timestamp, unit.as_deref()),
+        TsAction::ToTs { date, unit } => timestamp::cmd_to_ts(&date, &unit),
+        TsAction::Diff { a, b } => timestamp::cmd_diff(&a, &b),
+    }
 }
 
 #[cfg(test)]
