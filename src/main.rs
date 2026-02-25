@@ -1,6 +1,9 @@
 mod display;
 mod engine;
+mod export;
+mod input;
 mod jsonpath;
+mod jsonutil;
 mod timestamp;
 
 use anyhow::{bail, Context, Result};
@@ -68,14 +71,14 @@ enum TsAction {
 
 #[derive(Subcommand)]
 enum JsonAction {
-    /// Auto-detect and display JSON file schema
+    /// Auto-detect and display JSON file schema (use '-' for stdin)
     Schema {
-        /// Path to JSON file
+        /// Path to JSON file, or '-' for stdin
         file: String,
     },
     /// Preview first N rows
     Head {
-        /// Path to JSON file
+        /// Path to JSON file, or '-' for stdin
         file: String,
         /// Number of rows
         #[arg(short = 'n', long, default_value = "10")]
@@ -83,7 +86,7 @@ enum JsonAction {
     },
     /// Run SQL query (use 'data' as table name)
     Query {
-        /// Path to JSON file
+        /// Path to JSON file, or '-' for stdin
         file: String,
         /// SQL query string
         #[arg(short, long)]
@@ -91,14 +94,23 @@ enum JsonAction {
         /// Max rows to display
         #[arg(short, long, default_value = "100")]
         limit: usize,
+        /// Output format: table, csv, json, jsonl, md
+        #[arg(short, long, default_value = "table")]
+        output: String,
+        /// Export to file path (infers format from extension)
+        #[arg(short = 'O', long)]
+        outfile: Option<String>,
     },
     /// Show column statistics via SUMMARIZE
     Stats {
-        /// Path to JSON file
+        /// Path to JSON file, or '-' for stdin
         file: String,
         /// Specific columns (comma-separated)
         #[arg(short, long)]
         columns: Option<String>,
+        /// Output format: table, csv, json, jsonl, md
+        #[arg(short, long, default_value = "table")]
+        output: String,
     },
     /// Extract data using JSONPath expression
     Path {
@@ -121,7 +133,7 @@ enum JsonAction {
     },
     /// Render a terminal chart
     Chart {
-        /// Path to JSON file
+        /// Path to JSON file, or '-' for stdin
         file: String,
         /// Column to visualize
         #[arg(short, long)]
@@ -135,6 +147,32 @@ enum JsonAction {
         /// Max items for bar chart
         #[arg(short, long, default_value = "20")]
         max_items: usize,
+    },
+    /// Pretty-print JSON with indentation
+    Pretty {
+        /// Path to JSON file, or '-' for stdin
+        file: String,
+        /// Indentation spaces
+        #[arg(short, long, default_value = "2")]
+        indent: usize,
+    },
+    /// Minify JSON (remove whitespace)
+    Minify {
+        /// Path to JSON file, or '-' for stdin
+        file: String,
+    },
+    /// Validate JSON and show structure info
+    Validate {
+        /// Path to JSON file, or '-' for stdin
+        file: String,
+    },
+    /// Flatten nested JSON into dot-notation keys
+    Flatten {
+        /// Path to JSON file, or '-' for stdin
+        file: String,
+        /// Key separator
+        #[arg(short = 'd', long, default_value = ".")]
+        separator: String,
     },
 }
 
@@ -160,38 +198,43 @@ fn handle_json(action: JsonAction) -> Result<()> {
 
     let start = Instant::now();
 
-    let file = match &action {
-        JsonAction::Schema { file }
-        | JsonAction::Head { file, .. }
-        | JsonAction::Query { file, .. }
-        | JsonAction::Stats { file, .. }
-        | JsonAction::Chart { file, .. }
-        | JsonAction::Keys { file, .. } => file.clone(),
-        JsonAction::Path { file, syntax, .. } => {
-            if *syntax {
-                display::render_syntax_guide(jsonpath::syntax_guide());
-                return Ok(());
-            }
-            match file {
-                Some(f) => f.clone(),
-                None => bail!("Please provide a JSON file. Use --syntax to see JSONPath help."),
-            }
-        }
-    };
-
     match &action {
+        JsonAction::Pretty { file, indent } => {
+            let content = input::read_content(file)?;
+            jsonutil::cmd_pretty(&content, *indent)?;
+            return Ok(());
+        }
+        JsonAction::Minify { file } => {
+            let content = input::read_content(file)?;
+            jsonutil::cmd_minify(&content)?;
+            return Ok(());
+        }
+        JsonAction::Validate { file } => {
+            let content = input::read_content(file)?;
+            jsonutil::cmd_validate(&content, file)?;
+            return Ok(());
+        }
+        JsonAction::Flatten { file, separator } => {
+            let content = input::read_content(file)?;
+            jsonutil::cmd_flatten(&content, separator)?;
+            return Ok(());
+        }
         JsonAction::Path {
-            expression, syntax, ..
+            file,
+            expression,
+            syntax,
         } => {
             if *syntax {
                 display::render_syntax_guide(jsonpath::syntax_guide());
                 return Ok(());
             }
-
-            let content = std::fs::read_to_string(&file)
-                .with_context(|| format!("Failed to read file: {}", file))?;
+            let file = match file {
+                Some(f) => f.clone(),
+                None => bail!("Please provide a JSON file. Use --syntax to see JSONPath help."),
+            };
+            let content = input::read_content(&file)?;
             let json: serde_json::Value = serde_json::from_str(&content)
-                .with_context(|| format!("Invalid JSON in file: {}", file))?;
+                .with_context(|| format!("Invalid JSON in: {}", file))?;
 
             let expr = match expression {
                 Some(e) => e.as_str(),
@@ -203,43 +246,48 @@ fn handle_json(action: JsonAction) -> Result<()> {
 
             let results = jsonpath::parse_and_eval(&json, expr)?;
             display::render_jsonpath_results(&results, expr);
-
-            let elapsed = start.elapsed();
             eprintln!(
                 "\n  {} Completed in {:.3}s",
                 "⏱".dimmed(),
-                elapsed.as_secs_f64()
+                start.elapsed().as_secs_f64()
             );
             return Ok(());
         }
-        JsonAction::Keys { expression, .. } => {
-            let content = std::fs::read_to_string(&file)
-                .with_context(|| format!("Failed to read file: {}", file))?;
+        JsonAction::Keys { file, expression } => {
+            let content = input::read_content(file)?;
             let json: serde_json::Value = serde_json::from_str(&content)
-                .with_context(|| format!("Invalid JSON in file: {}", file))?;
+                .with_context(|| format!("Invalid JSON in: {}", file))?;
 
             let keys = jsonpath::list_keys(&json, expression.as_deref())?;
             display::render_keys(&keys, expression.as_deref().unwrap_or("$"));
-
-            let elapsed = start.elapsed();
             eprintln!(
                 "\n  {} Completed in {:.3}s",
                 "⏱".dimmed(),
-                elapsed.as_secs_f64()
+                start.elapsed().as_secs_f64()
             );
             return Ok(());
         }
         _ => {}
     }
 
+    let file_arg = match &action {
+        JsonAction::Schema { file }
+        | JsonAction::Head { file, .. }
+        | JsonAction::Query { file, .. }
+        | JsonAction::Stats { file, .. }
+        | JsonAction::Chart { file, .. } => file.as_str(),
+        _ => unreachable!(),
+    };
+
+    let source = input::resolve_input(file_arg)?;
     let eng = engine::Engine::new()?;
-    eng.register_json(&file)?;
+    eng.register_json(source.path())?;
 
     let row_count = eng.row_count()?;
     eprintln!(
         "  {} Loaded {} ({} rows)\n",
         "✓".green().bold(),
-        file.bold(),
+        source.label().bold(),
         row_count.to_string().cyan()
     );
 
@@ -252,14 +300,35 @@ fn handle_json(action: JsonAction) -> Result<()> {
             let result = eng.query("SELECT * FROM data", limit)?;
             display::render_table(&result);
         }
-        JsonAction::Query { sql, limit, .. } => {
+        JsonAction::Query {
+            sql,
+            limit,
+            output,
+            outfile,
+            ..
+        } => {
             let result = eng.query(&sql, limit)?;
-            display::render_table(&result);
+            let fmt_str = outfile
+                .as_deref()
+                .filter(|_| output == "table")
+                .unwrap_or(&output);
+            let fmt = export::OutputFormat::from_str_or_path(fmt_str)?;
+
+            match fmt {
+                export::OutputFormat::Table => display::render_table(&result),
+                _ => export::export_result(&result, &fmt, outfile.as_deref())?,
+            }
         }
-        JsonAction::Stats { columns, .. } => {
+        JsonAction::Stats {
+            columns, output, ..
+        } => {
             let cols = columns.map(|c| c.split(',').map(|s| s.trim().to_string()).collect());
             let result = eng.stats(cols)?;
-            display::render_table(&result);
+            let fmt = export::OutputFormat::from_str_or_path(&output)?;
+            match fmt {
+                export::OutputFormat::Table => display::render_table(&result),
+                _ => export::export_result(&result, &fmt, None)?,
+            }
         }
         JsonAction::Chart {
             column,
@@ -278,7 +347,7 @@ fn handle_json(action: JsonAction) -> Result<()> {
             }
             other => bail!("Unknown chart type '{}'. Use 'bar' or 'hist'.", other),
         },
-        JsonAction::Path { .. } | JsonAction::Keys { .. } => unreachable!(),
+        _ => unreachable!(),
     }
 
     let elapsed = start.elapsed();
