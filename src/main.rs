@@ -1,0 +1,168 @@
+mod display;
+mod engine;
+
+use anyhow::{bail, Result};
+use clap::{Parser, Subcommand};
+use colored::Colorize;
+use std::time::Instant;
+
+#[derive(Parser)]
+#[command(
+    name = "omnirust",
+    version,
+    about = "All your developer tools. One blazingly fast Rust binary."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// JSON analysis powered by DuckDB
+    Json {
+        #[command(subcommand)]
+        action: JsonAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum JsonAction {
+    /// Auto-detect and display JSON file schema
+    Schema {
+        /// Path to JSON file
+        file: String,
+    },
+    /// Preview first N rows
+    Head {
+        /// Path to JSON file
+        file: String,
+        /// Number of rows
+        #[arg(short = 'n', long, default_value = "10")]
+        limit: usize,
+    },
+    /// Run SQL query (use 'data' as table name)
+    Query {
+        /// Path to JSON file
+        file: String,
+        /// SQL query string
+        #[arg(short, long)]
+        sql: String,
+        /// Max rows to display
+        #[arg(short, long, default_value = "100")]
+        limit: usize,
+    },
+    /// Show column statistics via SUMMARIZE
+    Stats {
+        /// Path to JSON file
+        file: String,
+        /// Specific columns (comma-separated)
+        #[arg(short, long)]
+        columns: Option<String>,
+    },
+    /// Render a terminal chart
+    Chart {
+        /// Path to JSON file
+        file: String,
+        /// Column to visualize
+        #[arg(short, long)]
+        column: String,
+        /// Chart type: bar or hist
+        #[arg(short = 't', long, default_value = "bar")]
+        chart_type: String,
+        /// Number of histogram bins
+        #[arg(short, long, default_value = "15")]
+        bins: usize,
+        /// Max items for bar chart
+        #[arg(short, long, default_value = "20")]
+        max_items: usize,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Json { action } => handle_json(action),
+    }
+}
+
+fn handle_json(action: JsonAction) -> Result<()> {
+    let start = Instant::now();
+
+    let file = match &action {
+        JsonAction::Schema { file }
+        | JsonAction::Head { file, .. }
+        | JsonAction::Query { file, .. }
+        | JsonAction::Stats { file, .. }
+        | JsonAction::Chart { file, .. } => file.clone(),
+    };
+
+    let eng = engine::Engine::new()?;
+    eng.register_json(&file)?;
+
+    let row_count = eng.row_count()?;
+    eprintln!(
+        "  {} Loaded {} ({} rows)\n",
+        "✓".green().bold(),
+        file.bold(),
+        row_count.to_string().cyan()
+    );
+
+    match action {
+        JsonAction::Schema { .. } => {
+            let schema = eng.schema()?;
+            display::render_schema(&schema);
+        }
+        JsonAction::Head { limit, .. } => {
+            let result = eng.query("SELECT * FROM data", limit)?;
+            display::render_table(&result);
+        }
+        JsonAction::Query { sql, limit, .. } => {
+            let result = eng.query(&sql, limit)?;
+            display::render_table(&result);
+        }
+        JsonAction::Stats { columns, .. } => {
+            let cols = columns.map(|c| c.split(',').map(|s| s.trim().to_string()).collect());
+            let result = eng.stats(cols)?;
+            display::render_table(&result);
+        }
+        JsonAction::Chart {
+            column,
+            chart_type,
+            bins,
+            max_items,
+            ..
+        } => match chart_type.as_str() {
+            "bar" => {
+                let data = eng.value_counts(&column, max_items)?;
+                display::render_bar_chart(&data, &column);
+            }
+            "hist" | "histogram" => {
+                let data = eng.histogram_data(&column, bins)?;
+                display::render_histogram(&data, &column);
+            }
+            other => bail!("Unknown chart type '{}'. Use 'bar' or 'hist'.", other),
+        },
+    }
+
+    let elapsed = start.elapsed();
+    eprintln!(
+        "\n  {} Completed in {:.3}s",
+        "⏱".dimmed(),
+        elapsed.as_secs_f64()
+    );
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+}
