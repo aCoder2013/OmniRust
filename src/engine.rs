@@ -1,6 +1,11 @@
-use anyhow::{Context, Result};
-use duckdb::Connection;
-use std::path::Path;
+use anyhow::{bail, Context, Result};
+use arrow_json::ReaderBuilder;
+use datafusion::arrow::array::Array;
+use datafusion::arrow::util::display::array_value_to_string;
+use datafusion::datasource::MemTable;
+use datafusion::prelude::*;
+use std::io::Cursor;
+use std::sync::Arc;
 
 pub struct QueryResult {
     pub columns: Vec<ColumnInfo>,
@@ -14,46 +19,72 @@ pub struct ColumnInfo {
 }
 
 pub struct Engine {
-    conn: Connection,
+    ctx: SessionContext,
+    rt: tokio::runtime::Runtime,
 }
 
 impl Engine {
     pub fn new() -> Result<Self> {
-        let conn =
-            Connection::open_in_memory().context("Failed to create DuckDB in-memory database")?;
-        Ok(Self { conn })
+        let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+        let ctx = SessionContext::new();
+        Ok(Self { ctx, rt })
     }
 
-    pub fn register_json(&self, file: &str) -> Result<()> {
-        let path = Path::new(file)
-            .canonicalize()
-            .with_context(|| format!("File not found: {}", file))?;
-        let path_str = path.to_string_lossy().replace('\'', "''");
+    pub fn register_json(&self, file_path: &str) -> Result<()> {
+        let content = std::fs::read_to_string(file_path)
+            .with_context(|| format!("File not found: {}", file_path))?;
 
-        let sql = format!(
-            "CREATE OR REPLACE VIEW data AS SELECT * FROM read_json_auto('{}')",
-            path_str
-        );
-        self.conn
-            .execute_batch(&sql)
-            .with_context(|| format!("Failed to load JSON file: {}", file))?;
+        let ndjson = to_ndjson(&content)?;
+        let schema = {
+            let mut cursor = Cursor::new(&ndjson);
+            let (schema, _) = arrow_json::reader::infer_json_schema(&mut cursor, None)
+                .context("Failed to infer JSON schema")?;
+            Arc::new(schema)
+        };
+
+        let reader = ReaderBuilder::new(schema.clone())
+            .with_batch_size(8192)
+            .build(Cursor::new(&ndjson))
+            .context("Failed to build JSON reader")?;
+
+        let batches: Vec<_> = reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to read JSON data")?;
+
+        if batches.is_empty() {
+            bail!("No data found in JSON file");
+        }
+
+        let table =
+            MemTable::try_new(schema, vec![batches]).context("Failed to create in-memory table")?;
+
+        self.rt.block_on(async {
+            self.ctx
+                .register_table("data", Arc::new(table))
+                .map_err(|e| anyhow::anyhow!("Failed to register table: {}", e))
+        })?;
+
         Ok(())
     }
 
     pub fn schema(&self) -> Result<Vec<ColumnInfo>> {
-        let mut stmt = self.conn.prepare("DESCRIBE data")?;
-        let rows = stmt.query_map([], |row| {
-            Ok(ColumnInfo {
-                name: row.get::<_, String>(0)?,
-                dtype: row.get::<_, String>(1)?,
-            })
-        })?;
+        self.rt.block_on(async {
+            let df = self
+                .ctx
+                .table("data")
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let schema = df.schema();
 
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
-        }
-        Ok(result)
+            Ok(schema
+                .fields()
+                .iter()
+                .map(|f| ColumnInfo {
+                    name: f.name().clone(),
+                    dtype: format!("{}", f.data_type()),
+                })
+                .collect())
+        })
     }
 
     pub fn query(&self, sql: &str, limit: usize) -> Result<QueryResult> {
@@ -63,192 +94,266 @@ impl Engine {
             format!("{} LIMIT {}", sql.trim_end_matches(';'), limit)
         };
 
-        let base_sql = sql.trim_end_matches(';');
-        let describe_sql = format!("DESCRIBE {}", base_sql);
-        let columns: Vec<ColumnInfo> = match self.conn.prepare(&describe_sql) {
-            Ok(mut desc_stmt) => {
-                let col_info = desc_stmt.query_map([], |row| {
-                    Ok(ColumnInfo {
-                        name: row.get::<_, String>(0)?,
-                        dtype: row.get::<_, String>(1)?,
-                    })
-                })?;
-                col_info.filter_map(|r| r.ok()).collect()
+        self.rt.block_on(async {
+            let df = self
+                .ctx
+                .sql(&query_sql)
+                .await
+                .with_context(|| format!("Invalid SQL: {}", sql))?;
+            let schema = df.schema().clone();
+            let batches = df.collect().await.context("Failed to execute query")?;
+
+            let columns: Vec<ColumnInfo> = schema
+                .fields()
+                .iter()
+                .map(|f| ColumnInfo {
+                    name: f.name().clone(),
+                    dtype: format!("{}", f.data_type()),
+                })
+                .collect();
+
+            let mut rows = Vec::new();
+            for batch in &batches {
+                for row_idx in 0..batch.num_rows() {
+                    let row: Vec<String> = (0..batch.num_columns())
+                        .map(|col_idx| extract_cell(batch.column(col_idx), row_idx))
+                        .collect();
+                    rows.push(row);
+                }
             }
-            Err(_) => Vec::new(),
-        };
-        let col_count = columns.len();
 
-        let mut stmt = self
-            .conn
-            .prepare(&query_sql)
-            .with_context(|| format!("Invalid SQL: {}", sql))?;
-
-        let rows_iter = stmt.query_map([], |row| {
-            let vals: Vec<String> = (0..col_count).map(|i| extract_cell(row, i)).collect();
-            Ok(vals)
-        })?;
-
-        let mut rows = Vec::new();
-        for row in rows_iter {
-            rows.push(row?);
-        }
-
-        Ok(QueryResult {
-            columns,
-            rows,
-            total_count: None,
+            Ok(QueryResult {
+                columns,
+                rows,
+                total_count: None,
+            })
         })
     }
 
     pub fn row_count(&self) -> Result<usize> {
-        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM data")?;
-        let count: i64 = stmt.query_row([], |row| row.get(0))?;
-        Ok(count as usize)
+        self.rt.block_on(async {
+            let df = self
+                .ctx
+                .sql("SELECT COUNT(*) AS cnt FROM data")
+                .await
+                .context("Failed to count rows")?;
+            let batches = df.collect().await?;
+
+            if let Some(batch) = batches.first() {
+                if batch.num_rows() > 0 {
+                    let val = extract_cell(batch.column(0), 0);
+                    return Ok(val.parse::<usize>().unwrap_or(0));
+                }
+            }
+            Ok(0)
+        })
     }
 
     pub fn stats(&self, columns: Option<Vec<String>>) -> Result<QueryResult> {
-        let sql = match columns {
-            Some(cols) => {
-                let select_cols = cols
-                    .iter()
-                    .map(|c| format!("\"{}\"", c))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("SUMMARIZE SELECT {} FROM data", select_cols)
+        self.rt.block_on(async {
+            let df = self.ctx.table("data").await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let schema = df.schema().clone();
+
+            let col_names: Vec<String> = match columns {
+                Some(c) => c,
+                None => schema.fields().iter().map(|f| f.name().clone()).collect(),
+            };
+
+            let mut stat_rows: Vec<Vec<String>> = Vec::new();
+
+            for col_name in &col_names {
+                let field = schema
+                    .field_with_name(None, col_name)
+                    .map_err(|e| anyhow::anyhow!("Column '{}' not found: {}", col_name, e))?;
+                let is_numeric = field.data_type().is_numeric();
+
+                let sql = if is_numeric {
+                    format!(
+                        "SELECT \
+                            CAST(MIN(\"{c}\") AS VARCHAR), \
+                            CAST(MAX(\"{c}\") AS VARCHAR), \
+                            CAST(COUNT(DISTINCT \"{c}\") AS VARCHAR), \
+                            CAST(ROUND(AVG(CAST(\"{c}\" AS DOUBLE)), 2) AS VARCHAR), \
+                            CAST(ROUND(STDDEV(CAST(\"{c}\" AS DOUBLE)), 2) AS VARCHAR), \
+                            CAST(COUNT(*) AS VARCHAR), \
+                            CAST(ROUND(100.0 * CAST(COUNT(*) - COUNT(\"{c}\") AS DOUBLE) / COUNT(*), 1) AS VARCHAR) \
+                        FROM data",
+                        c = col_name
+                    )
+                } else {
+                    format!(
+                        "SELECT \
+                            CAST(MIN(\"{c}\") AS VARCHAR) AS min_val, \
+                            CAST(MAX(\"{c}\") AS VARCHAR) AS max_val, \
+                            CAST(COUNT(DISTINCT \"{c}\") AS VARCHAR) AS uniq, \
+                            'NULL' AS avg_val, \
+                            'NULL' AS std_val, \
+                            CAST(COUNT(*) AS VARCHAR) AS cnt, \
+                            CAST(ROUND(100.0 * CAST(COUNT(*) - COUNT(\"{c}\") AS DOUBLE) / COUNT(*), 1) AS VARCHAR) AS null_pct \
+                        FROM data",
+                        c = col_name
+                    )
+                };
+
+                let df = self.ctx.sql(&sql).await?;
+                let batches = df.collect().await?;
+
+                if let Some(batch) = batches.first() {
+                    if batch.num_rows() > 0 {
+                        let mut row = vec![
+                            col_name.clone(),
+                            format!("{}", field.data_type()),
+                        ];
+                        for col_idx in 0..batch.num_columns() {
+                            row.push(extract_cell(batch.column(col_idx), 0));
+                        }
+                        stat_rows.push(row);
+                    }
+                }
             }
-            None => "SUMMARIZE data".to_string(),
-        };
 
-        let describe_sql = format!(
-            "DESCRIBE {}",
-            sql.replace("SUMMARIZE", "SELECT * FROM (SUMMARIZE")
-        ) + ")";
-        let columns: Vec<ColumnInfo> = match self.conn.prepare(&describe_sql) {
-            Ok(mut desc_stmt) => {
-                let col_info = desc_stmt.query_map([], |row| {
-                    Ok(ColumnInfo {
-                        name: row.get::<_, String>(0)?,
-                        dtype: row.get::<_, String>(1)?,
-                    })
-                })?;
-                col_info.filter_map(|r| r.ok()).collect()
-            }
-            Err(_) => Vec::new(),
-        };
-        let col_count = columns.len();
+            let stat_columns = vec![
+                ci("column_name"),
+                ci("column_type"),
+                ci("min"),
+                ci("max"),
+                ci("approx_unique"),
+                ci("avg"),
+                ci("std"),
+                ci("count"),
+                ci("null_percentage"),
+            ];
 
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .with_context(|| "Failed to execute SUMMARIZE".to_string())?;
-
-        let rows_iter = stmt.query_map([], |row| {
-            let vals: Vec<String> = (0..col_count).map(|i| extract_cell(row, i)).collect();
-            Ok(vals)
-        })?;
-
-        let mut rows = Vec::new();
-        for row in rows_iter {
-            rows.push(row?);
-        }
-
-        Ok(QueryResult {
-            columns,
-            rows,
-            total_count: None,
+            Ok(QueryResult {
+                columns: stat_columns,
+                rows: stat_rows,
+                total_count: None,
+            })
         })
     }
 
     pub fn value_counts(&self, column: &str, max_items: usize) -> Result<Vec<(String, i64)>> {
         let sql = format!(
-            "SELECT CAST(\"{}\" AS VARCHAR) as val, COUNT(*) as cnt \
+            "SELECT CAST(\"{}\" AS VARCHAR) AS val, COUNT(*) AS cnt \
              FROM data \
              WHERE \"{}\" IS NOT NULL \
-             GROUP BY \"{}\" \
+             GROUP BY CAST(\"{}\" AS VARCHAR) \
              ORDER BY cnt DESC \
              LIMIT {}",
             column, column, column, max_items
         );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
-            let val: String = row.get(0)?;
-            let cnt: i64 = row.get(1)?;
-            Ok((val, cnt))
-        })?;
 
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
-        }
-        Ok(result)
+        self.rt.block_on(async {
+            let df = self.ctx.sql(&sql).await?;
+            let batches = df.collect().await?;
+            let mut result = Vec::new();
+
+            for batch in &batches {
+                for row_idx in 0..batch.num_rows() {
+                    let val = extract_cell(batch.column(0), row_idx);
+                    let cnt: i64 = extract_cell(batch.column(1), row_idx).parse().unwrap_or(0);
+                    result.push((val, cnt));
+                }
+            }
+            Ok(result)
+        })
     }
 
     pub fn histogram_data(&self, column: &str, bins: usize) -> Result<Vec<(f64, f64, i64)>> {
         let sql = format!(
             "WITH bounds AS ( \
-                SELECT MIN(\"{col}\")::DOUBLE as mn, MAX(\"{col}\")::DOUBLE as mx FROM data \
-                WHERE \"{col}\" IS NOT NULL \
+                SELECT MIN(CAST(\"{col}\" AS DOUBLE)) AS mn, MAX(CAST(\"{col}\" AS DOUBLE)) AS mx \
+                FROM data WHERE \"{col}\" IS NOT NULL \
              ), \
              params AS ( \
-                SELECT mn, mx, (mx - mn) / {bins}.0 as bin_width FROM bounds \
+                SELECT mn, mx, (mx - mn) / {bins}.0 AS bin_width FROM bounds \
              ), \
              binned AS ( \
                 SELECT \
                     CASE \
-                        WHEN bin_width = 0 THEN 0 \
-                        ELSE LEAST(FLOOR((\"{col}\"::DOUBLE - mn) / bin_width), {bins} - 1) \
-                    END as bin_idx, \
-                    COUNT(*) as cnt \
-                FROM data, params \
+                        WHEN params.bin_width = 0 THEN 0 \
+                        ELSE CAST(FLOOR((CAST(\"{col}\" AS DOUBLE) - params.mn) / params.bin_width) AS BIGINT) \
+                    END AS bin_idx, \
+                    COUNT(*) AS cnt \
+                FROM data CROSS JOIN params \
                 WHERE \"{col}\" IS NOT NULL \
                 GROUP BY bin_idx \
                 ORDER BY bin_idx \
              ) \
              SELECT \
-                mn + bin_idx * bin_width as bin_start, \
-                mn + (bin_idx + 1) * bin_width as bin_end, \
-                cnt \
-             FROM binned, params \
+                params.mn + CAST(binned.bin_idx AS DOUBLE) * params.bin_width AS bin_start, \
+                params.mn + (CAST(binned.bin_idx AS DOUBLE) + 1) * params.bin_width AS bin_end, \
+                binned.cnt \
+             FROM binned CROSS JOIN params \
              ORDER BY bin_start",
             col = column,
             bins = bins
         );
 
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .with_context(|| format!("Column '{}' may not be numeric", column))?;
-        let rows = stmt.query_map([], |row| {
-            let start: f64 = row.get(0)?;
-            let end: f64 = row.get(1)?;
-            let cnt: i64 = row.get(2)?;
-            Ok((start, end, cnt))
-        })?;
+        self.rt.block_on(async {
+            let df = self
+                .ctx
+                .sql(&sql)
+                .await
+                .with_context(|| format!("Column '{}' may not be numeric", column))?;
+            let batches = df.collect().await?;
+            let mut result = Vec::new();
 
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
-        }
-        Ok(result)
+            for batch in &batches {
+                for row_idx in 0..batch.num_rows() {
+                    let start: f64 = extract_cell(batch.column(0), row_idx)
+                        .parse()
+                        .unwrap_or(0.0);
+                    let end: f64 = extract_cell(batch.column(1), row_idx)
+                        .parse()
+                        .unwrap_or(0.0);
+                    let cnt: i64 = extract_cell(batch.column(2), row_idx).parse().unwrap_or(0);
+                    result.push((start, end, cnt));
+                }
+            }
+            Ok(result)
+        })
     }
 }
 
-fn extract_cell(row: &duckdb::Row, idx: usize) -> String {
-    if let Ok(v) = row.get::<_, String>(idx) {
-        return v;
-    }
-    if let Ok(v) = row.get::<_, i64>(idx) {
-        return v.to_string();
-    }
-    if let Ok(v) = row.get::<_, f64>(idx) {
-        if v.fract() == 0.0 && v.abs() < 1e15 {
-            return format!("{:.0}", v);
+fn to_ndjson(content: &str) -> Result<Vec<u8>> {
+    let trimmed = content.trim();
+    if trimmed.starts_with('[') {
+        let arr: Vec<serde_json::Value> =
+            serde_json::from_str(trimmed).context("Invalid JSON array")?;
+        let mut buf = Vec::new();
+        for item in &arr {
+            serde_json::to_writer(&mut buf, item)?;
+            buf.push(b'\n');
         }
-        return format!("{}", v);
+        Ok(buf)
+    } else if trimmed.contains('\n') && !trimmed.starts_with('{') {
+        Ok(trimmed.as_bytes().to_vec())
+    } else {
+        let mut buf = Vec::new();
+        for line in trimmed.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                let _: serde_json::Value = serde_json::from_str(line).context("Invalid JSON")?;
+                buf.extend_from_slice(line.as_bytes());
+                buf.push(b'\n');
+            }
+        }
+        Ok(buf)
     }
-    if let Ok(v) = row.get::<_, bool>(idx) {
-        return v.to_string();
+}
+
+fn extract_cell(col: &dyn Array, row: usize) -> String {
+    if col.is_null(row) {
+        return "NULL".to_string();
     }
-    "NULL".to_string()
+    array_value_to_string(col, row).unwrap_or_else(|_| "NULL".to_string())
+}
+
+fn ci(name: &str) -> ColumnInfo {
+    ColumnInfo {
+        name: name.to_string(),
+        dtype: String::new(),
+    }
 }
