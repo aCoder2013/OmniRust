@@ -75,6 +75,9 @@ enum JsonAction {
     Schema {
         /// Path to JSON file, or '-' for stdin
         file: String,
+        /// Root path to data array (e.g. "result.dataList")
+        #[arg(short, long)]
+        root: Option<String>,
     },
     /// Preview first N rows
     Head {
@@ -83,6 +86,9 @@ enum JsonAction {
         /// Number of rows
         #[arg(short = 'n', long, default_value = "10")]
         limit: usize,
+        /// Root path to data array (e.g. "result.dataList")
+        #[arg(short, long)]
+        root: Option<String>,
     },
     /// Run SQL query (use 'data' as table name)
     Query {
@@ -100,6 +106,9 @@ enum JsonAction {
         /// Export to file path (infers format from extension)
         #[arg(short = 'O', long)]
         outfile: Option<String>,
+        /// Root path to data array (e.g. "result.dataList")
+        #[arg(short, long)]
+        root: Option<String>,
     },
     /// Show column statistics via SUMMARIZE
     Stats {
@@ -111,6 +120,9 @@ enum JsonAction {
         /// Output format: table, csv, json, jsonl, md
         #[arg(short, long, default_value = "table")]
         output: String,
+        /// Root path to data array (e.g. "result.dataList")
+        #[arg(long)]
+        root: Option<String>,
     },
     /// Extract data using JSONPath expression
     Path {
@@ -147,6 +159,9 @@ enum JsonAction {
         /// Max items for bar chart
         #[arg(short, long, default_value = "20")]
         max_items: usize,
+        /// Root path to data array (e.g. "result.dataList")
+        #[arg(long)]
+        root: Option<String>,
     },
     /// Pretty-print JSON with indentation
     Pretty {
@@ -270,18 +285,18 @@ fn handle_json(action: JsonAction) -> Result<()> {
         _ => {}
     }
 
-    let file_arg = match &action {
-        JsonAction::Schema { file }
-        | JsonAction::Head { file, .. }
-        | JsonAction::Query { file, .. }
-        | JsonAction::Stats { file, .. }
-        | JsonAction::Chart { file, .. } => file.as_str(),
+    let (file_arg, root_arg) = match &action {
+        JsonAction::Schema { file, root } => (file.as_str(), root.as_deref()),
+        JsonAction::Head { file, root, .. } => (file.as_str(), root.as_deref()),
+        JsonAction::Query { file, root, .. } => (file.as_str(), root.as_deref()),
+        JsonAction::Stats { file, root, .. } => (file.as_str(), root.as_deref()),
+        JsonAction::Chart { file, root, .. } => (file.as_str(), root.as_deref()),
         _ => unreachable!(),
     };
 
     let source = input::resolve_input(file_arg)?;
     let eng = engine::Engine::new()?;
-    eng.register_json(source.path())?;
+    eng.register_json(source.path(), root_arg)?;
 
     let row_count = eng.row_count()?;
     eprintln!(

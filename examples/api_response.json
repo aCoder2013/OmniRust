@@ -1,0 +1,16 @@
+{
+  "msg": "success",
+  "result": {
+    "dataList": [
+      {"id": 1, "name": "Alice", "score": 95, "status": "active"},
+      {"id": 2, "name": "Bob", "score": 82, "status": "active"},
+      {"id": 3, "name": "Charlie", "score": 78, "status": "inactive"},
+      {"id": 4, "name": "Diana", "score": 91, "status": "active"},
+      {"id": 5, "name": "Eve", "score": 88, "status": "inactive"}
+    ],
+    "elapseTime": 7037,
+    "scrollId": null,
+    "total": 5
+  },
+  "resultCode": 0
+}
