@@ -1,9 +1,11 @@
 use anyhow::{bail, Context, Result};
 use arrow_json::ReaderBuilder;
+use colored::Colorize;
 use datafusion::arrow::array::Array;
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
+use serde_json::Value;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -30,11 +32,23 @@ impl Engine {
         Ok(Self { ctx, rt })
     }
 
-    pub fn register_json(&self, file_path: &str) -> Result<()> {
+    pub fn register_json(&self, file_path: &str, root: Option<&str>) -> Result<()> {
         let content = std::fs::read_to_string(file_path)
             .with_context(|| format!("File not found: {}", file_path))?;
+        self.register_json_content(&content, root)
+    }
 
-        let ndjson = to_ndjson(&content)?;
+    pub fn register_json_content(&self, content: &str, root: Option<&str>) -> Result<()> {
+        let parsed: Value = serde_json::from_str(content.trim()).context("Invalid JSON")?;
+
+        let array_data = extract_array(&parsed, root)?;
+
+        let ndjson = values_to_ndjson(&array_data)?;
+
+        if ndjson.is_empty() {
+            bail!("No data rows found");
+        }
+
         let schema = {
             let mut cursor = Cursor::new(&ndjson);
             let (schema, _) = arrow_json::reader::infer_json_schema(&mut cursor, None)
@@ -52,7 +66,7 @@ impl Engine {
             .context("Failed to read JSON data")?;
 
         if batches.is_empty() {
-            bail!("No data found in JSON file");
+            bail!("No data found in JSON");
         }
 
         let table =
@@ -151,7 +165,10 @@ impl Engine {
 
     pub fn stats(&self, columns: Option<Vec<String>>) -> Result<QueryResult> {
         self.rt.block_on(async {
-            let df = self.ctx.table("data").await
+            let df = self
+                .ctx
+                .table("data")
+                .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             let schema = df.schema().clone();
 
@@ -201,10 +218,7 @@ impl Engine {
 
                 if let Some(batch) = batches.first() {
                     if batch.num_rows() > 0 {
-                        let mut row = vec![
-                            col_name.clone(),
-                            format!("{}", field.data_type()),
-                        ];
+                        let mut row = vec![col_name.clone(), format!("{}", field.data_type())];
                         for col_idx in 0..batch.num_columns() {
                             row.push(extract_cell(batch.column(col_idx), 0));
                         }
@@ -317,31 +331,181 @@ impl Engine {
     }
 }
 
-fn to_ndjson(content: &str) -> Result<Vec<u8>> {
-    let trimmed = content.trim();
-    if trimmed.starts_with('[') {
-        let arr: Vec<serde_json::Value> =
-            serde_json::from_str(trimmed).context("Invalid JSON array")?;
-        let mut buf = Vec::new();
-        for item in &arr {
-            serde_json::to_writer(&mut buf, item)?;
-            buf.push(b'\n');
-        }
-        Ok(buf)
-    } else if trimmed.contains('\n') && !trimmed.starts_with('{') {
-        Ok(trimmed.as_bytes().to_vec())
-    } else {
-        let mut buf = Vec::new();
-        for line in trimmed.lines() {
-            let line = line.trim();
-            if !line.is_empty() {
-                let _: serde_json::Value = serde_json::from_str(line).context("Invalid JSON")?;
-                buf.extend_from_slice(line.as_bytes());
-                buf.push(b'\n');
+fn extract_array(val: &Value, root: Option<&str>) -> Result<Vec<Value>> {
+    let target = match root {
+        Some(path) => navigate(val, path)?,
+        None => val.clone(),
+    };
+
+    match target {
+        Value::Array(arr) => Ok(arr),
+        Value::Object(_) => {
+            if root.is_some() {
+                Ok(vec![target])
+            } else {
+                match find_best_array(&target) {
+                    Some((path, arr)) => {
+                        eprintln!(
+                            "  {} Auto-detected data array at {} ({} items)",
+                            "ℹ".blue(),
+                            format!("\"{}\"", path).yellow(),
+                            arr.len().to_string().cyan()
+                        );
+                        eprintln!(
+                            "  {} Use {} to specify explicitly\n",
+                            "Tip:".bold(),
+                            format!("--root {}", path).cyan()
+                        );
+                        Ok(arr)
+                    }
+                    None => Ok(vec![target]),
+                }
             }
         }
-        Ok(buf)
+        Value::Null => bail!("JSON value is null"),
+        _ => Ok(vec![target]),
     }
+}
+
+fn navigate(val: &Value, path: &str) -> Result<Value> {
+    let path = path.trim().trim_start_matches('$').trim_start_matches('.');
+    if path.is_empty() {
+        return Ok(val.clone());
+    }
+
+    let mut current = val;
+    for segment in split_path(path) {
+        match current {
+            Value::Object(map) => match map.get(&segment) {
+                Some(v) => current = v,
+                None => bail!(
+                    "Key '{}' not found. Available keys: {}",
+                    segment,
+                    map.keys()
+                        .map(|k| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
+            Value::Array(arr) => {
+                if let Ok(idx) = segment.parse::<usize>() {
+                    match arr.get(idx) {
+                        Some(v) => current = v,
+                        None => bail!("Index {} out of range (length {})", idx, arr.len()),
+                    }
+                } else {
+                    let extracted: Vec<Value> = arr
+                        .iter()
+                        .filter_map(|item| item.get(&segment).cloned())
+                        .collect();
+                    if extracted.is_empty() {
+                        bail!("Key '{}' not found in array elements", segment);
+                    }
+                    return Ok(Value::Array(extracted));
+                }
+            }
+            _ => bail!(
+                "Cannot navigate into {} at '{}'",
+                type_name(current),
+                segment
+            ),
+        }
+    }
+    Ok(current.clone())
+}
+
+fn split_path(path: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut in_bracket = false;
+
+    for ch in path.chars() {
+        match ch {
+            '.' if !in_bracket => {
+                if !current.is_empty() {
+                    segments.push(current.clone());
+                    current.clear();
+                }
+            }
+            '[' => {
+                if !current.is_empty() {
+                    segments.push(current.clone());
+                    current.clear();
+                }
+                in_bracket = true;
+            }
+            ']' => {
+                in_bracket = false;
+                if !current.is_empty() {
+                    let key = current.trim_matches(|c| c == '\'' || c == '"').to_string();
+                    segments.push(key);
+                    current.clear();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn find_best_array(val: &Value) -> Option<(String, Vec<Value>)> {
+    if let Value::Object(map) = val {
+        let mut best: Option<(String, Vec<Value>)> = None;
+
+        for (key, v) in map {
+            if let Value::Array(arr) = v {
+                if !arr.is_empty() && arr.iter().any(|item| item.is_object()) {
+                    let is_better = match &best {
+                        None => true,
+                        Some((_, existing)) => arr.len() > existing.len(),
+                    };
+                    if is_better {
+                        best = Some((key.clone(), arr.clone()));
+                    }
+                }
+            }
+
+            if let Value::Object(_) = v {
+                if let Some((sub_path, arr)) = find_best_array(v) {
+                    let full_path = format!("{}.{}", key, sub_path);
+                    let is_better = match &best {
+                        None => true,
+                        Some((_, existing)) => arr.len() > existing.len(),
+                    };
+                    if is_better {
+                        best = Some((full_path, arr));
+                    }
+                }
+            }
+        }
+
+        best
+    } else {
+        None
+    }
+}
+
+fn type_name(val: &Value) -> &'static str {
+    match val {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn values_to_ndjson(values: &[Value]) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    for item in values {
+        serde_json::to_writer(&mut buf, item)?;
+        buf.push(b'\n');
+    }
+    Ok(buf)
 }
 
 fn extract_cell(col: &dyn Array, row: usize) -> String {
